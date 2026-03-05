@@ -162,7 +162,7 @@ def _heuristic_analysis(stats: dict) -> dict:
 METHODOLOGIST_SYSTEM = (
     "Ты — нутрициолог и специалист по поведенческой терапии. "
     "Отвечаешь кратко, дружелюбно и со ссылками на научные данные из базы знаний. "
-    "Если в базе нет ответа, честно скажи об этом."
+    "Если в базе нет ответа, честно скажи об этом. НЕ выдумывай исследования или статистику "
 )
 
 METHODOLOGIST_PROMPT = """\
@@ -191,7 +191,7 @@ async def get_recommendation(
         sources=sources,
         question=question,
     )
-    return await llm.generate(prompt, system=METHODOLOGIST_SYSTEM, temperature=0.5)
+    return await llm.generate(prompt, system=METHODOLOGIST_SYSTEM, temperature=0.3)
 
 
 # ---------------------------------------------------------------------------
@@ -239,7 +239,7 @@ async def generate_quests(
     )
 
     try:
-        raw = await llm.generate(prompt, system=GAME_DESIGNER_SYSTEM, temperature=0.7, max_tokens=256)
+        raw = await llm.generate(prompt, system=GAME_DESIGNER_SYSTEM, temperature=0.5, max_tokens=256)
         quests = json.loads(_extract_json(raw))
         if isinstance(quests, list):
             return quests[:5]
