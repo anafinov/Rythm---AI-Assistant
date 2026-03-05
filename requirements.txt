@@ -1,0 +1,12 @@
+aiogram>=3.14
+sqlalchemy[asyncio]>=2.0
+asyncpg
+redis>=5.0
+llama-cpp-python>=0.3
+langchain>=0.3
+langchain-community
+pydantic-settings
+pandas
+numpy
+psutil
+jinja2
