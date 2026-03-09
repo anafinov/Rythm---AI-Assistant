@@ -1,7 +1,7 @@
 """Three agent functions: analyst, methodologist, game designer.
 
 Each agent is a plain async function that builds a prompt, calls LLM, and
-returns structured data.  No complex LangChain graphs — just prompt chains.
+returns structured data. No complex LangChain graphs — just prompt chains.
 """
 
 from __future__ import annotations
@@ -239,12 +239,26 @@ async def generate_quests(
     )
 
     try:
-        raw = await llm.generate(prompt, system=GAME_DESIGNER_SYSTEM, temperature=0.5, max_tokens=256)
+        raw = await llm.generate(
+            prompt,
+            system=GAME_DESIGNER_SYSTEM,
+            temperature=0.5,
+            max_tokens=256,
+        )
         quests = json.loads(_extract_json(raw))
         if isinstance(quests, list):
             return quests[:5]
-    except Exception:
-        logger.warning("Game designer JSON parse failed, returning defaults")
+        logger.warning(
+            "Game designer returned non-list JSON, using defaults. Parsed: %r, raw: %r",
+            quests,
+            raw,
+        )
+    except Exception as e:
+        logger.warning(
+            "Game designer JSON parse failed, returning defaults. Error: %s, raw: %r",
+            e,
+            raw if "raw" in locals() else "<no raw>",
+        )
 
     return default_quests(analysis.get("soft_mode", False))
 
