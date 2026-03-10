@@ -8,6 +8,7 @@ class OnboardingState(StatesGroup):
     gender = State()
     activity = State()
     goal_weight = State()
+    maintenance_confirm = State()
 
 
 class CheckInState(StatesGroup):
@@ -15,3 +16,4 @@ class CheckInState(StatesGroup):
     sleep = State()
     stress = State()
     mood = State()
+    note = State()

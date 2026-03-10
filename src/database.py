@@ -21,6 +21,7 @@ class User(Base):
     age: Mapped[int | None] = mapped_column(Integer)
     gender: Mapped[str | None] = mapped_column(String(10))
     activity: Mapped[str | None] = mapped_column(String(20))
+    mode: Mapped[str] = mapped_column(String(20), default="active")
     onboarded: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
@@ -39,6 +40,7 @@ class CheckIn(Base):
     sleep_hours: Mapped[float | None] = mapped_column(Float)
     stress: Mapped[int | None] = mapped_column(Integer)
     mood: Mapped[int | None] = mapped_column(Integer)
+    note: Mapped[str | None] = mapped_column(Text)
 
     user: Mapped["User"] = relationship(back_populates="check_ins")
 
@@ -55,6 +57,7 @@ class Quest(Base):
     xp_reward: Mapped[int] = mapped_column(Integer, default=10)
     completed: Mapped[bool] = mapped_column(Boolean, default=False)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime)
+    skipped: Mapped[bool] = mapped_column(Boolean, default=False)
 
     user: Mapped["User"] = relationship(back_populates="quests")
 

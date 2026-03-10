@@ -11,6 +11,9 @@ def main_menu() -> InlineKeyboardMarkup:
         ],
         [
             InlineKeyboardButton(text="👤 Профиль", callback_data="profile"),
+            InlineKeyboardButton(text="🗺 Роадмап", callback_data="roadmap"),
+        ],
+        [
             InlineKeyboardButton(text="❓ Задать вопрос", callback_data="ask"),
         ],
     ])
@@ -63,6 +66,14 @@ def quest_actions(quest_id: int) -> InlineKeyboardMarkup:
 def skip_weight_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Пропустить", callback_data="checkin_skip_weight")]
+    ])
+
+
+# ── Skip note in check-in ──────────────────────────────────────────────
+
+def skip_note_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Пропустить", callback_data="checkin_skip_note")]
     ])
 
 

@@ -10,7 +10,7 @@ from aiogram import F, Router
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src import agents
@@ -22,7 +22,9 @@ from src.keyboards import (
     main_menu,
     quest_actions,
     scale_keyboard,
+    skip_note_keyboard,
     skip_weight_keyboard,
+    yes_no_keyboard,
 )
 from src.states import CheckInState, OnboardingState
 from src.utils import build_roadmap, format_roadmap
@@ -31,7 +33,21 @@ logger = logging.getLogger(__name__)
 
 router = Router()
 
-CRISIS_KEYWORDS = ["бросить", "не могу", "сдаюсь", "плохо", "бесполезно", "устал", "ненавижу"]
+CRISIS_PHRASES = [
+    "хочу бросить",
+    "хочу всё бросить",
+    "хочу сдаться",
+    "не могу больше",
+    "я сдаюсь",
+    "всё бесполезно",
+    "это бесполезно",
+    "ненавижу себя",
+    "мне плохо",
+    "мне очень плохо",
+    "я устал от всего",
+    "не вижу смысла",
+    "ничего не получается",
+]
 
 CRISIS_REPLY = (
     "Я слышу тебя. То, что ты чувствуешь — нормально, и это не значит, что ты проиграл(а). "
@@ -116,6 +132,70 @@ async def cmd_start(message: Message, session: AsyncSession, state: FSMContext):
     await state.set_state(OnboardingState.weight)
 
 
+@router.message(Command("reset"))
+async def cmd_reset(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer(
+        "⚠️ <b>Сброс прогресса</b>\n\n"
+        "Этот шаг удалит твои чек-ины, квесты и прогресс (XP, уровень) "
+        "и вернёт онбординг к началу.\n\n"
+        "Ты уверен(а), что хочешь всё сбросить?",
+        reply_markup=yes_no_keyboard("reset"),
+    )
+
+
+@router.callback_query(F.data == "reset_yes")
+async def confirm_reset(callback: CallbackQuery, session: AsyncSession, state: FSMContext):
+    await state.clear()
+    user = await get_or_create_user(session, callback.from_user.id, callback.from_user.username)
+
+    if not user.onboarded:
+        await callback.message.edit_text(
+            "У тебя ещё нет сохранённого прогресса. Просто пройди онбординг через /start.",
+            reply_markup=main_menu(),
+        )
+        await callback.answer()
+        return
+
+    await callback.message.edit_text("⏳ Сбрасываю данные…")
+
+    await session.execute(delete(CheckIn).where(CheckIn.user_id == user.id))
+    await session.execute(delete(Quest).where(Quest.user_id == user.id))
+
+    progress = await get_progress(session, user.id)
+    progress.xp = 0
+    progress.level = 1
+    progress.streak_days = 0
+    progress.last_checkin_date = None
+
+    user.weight = None
+    user.goal_weight = None
+    user.height = None
+    user.age = None
+    user.gender = None
+    user.activity = None
+    user.mode = "active"
+    user.onboarded = False
+
+    await session.commit()
+
+    await callback.message.edit_text(
+        "🔄 Прогресс и данные профиля сброшены.\n\n"
+        "Можешь заново пройти онбординг через команду /start.",
+        reply_markup=main_menu(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "reset_no")
+async def cancel_reset(callback: CallbackQuery):
+    await callback.message.edit_text(
+        "Окей, ничего не трогаю 🙂",
+        reply_markup=main_menu(),
+    )
+    await callback.answer()
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Onboarding FSM
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -190,25 +270,63 @@ async def onb_goal(message: Message, state: FSMContext, session: AsyncSession):
         return
 
     data = await state.get_data()
-    user = await get_or_create_user(session, message.from_user.id, message.from_user.username)
+
+    if abs(gw - data["weight"]) <= 1.0:
+        await state.update_data(goal_weight=gw)
+        await message.answer(
+            f"Твой целевой вес (<b>{gw} кг</b>) очень близок к текущему (<b>{data['weight']} кг</b>).\n\n"
+            "Хочешь перейти в <b>режим удержания веса</b>? "
+            "Я буду помогать тебе сохранять стабильный вес и закреплять привычки.",
+            reply_markup=yes_no_keyboard("maintenance"),
+        )
+        await state.set_state(OnboardingState.maintenance_confirm)
+        return
+
+    await _save_onboarding(message, state, session, gw, user_mode="active")
+
+
+@router.callback_query(OnboardingState.maintenance_confirm, F.data == "maintenance_yes")
+async def onb_maintenance_yes(callback: CallbackQuery, state: FSMContext, session: AsyncSession):
+    data = await state.get_data()
+    gw = data["weight"]
+    await _save_onboarding(callback.message, state, session, gw, user_mode="maintenance",
+                           from_user=callback.from_user)
+    await callback.answer()
+
+
+@router.callback_query(OnboardingState.maintenance_confirm, F.data == "maintenance_no")
+async def onb_maintenance_no(callback: CallbackQuery, state: FSMContext):
+    await callback.message.edit_text("Хорошо! Введи <b>целевой вес</b> (в кг):")
+    await state.set_state(OnboardingState.goal_weight)
+    await callback.answer()
+
+
+async def _save_onboarding(message, state: FSMContext, session: AsyncSession,
+                           goal_weight: float, user_mode: str, from_user=None):
+    """Finish onboarding: save user profile and show roadmap."""
+    data = await state.get_data()
+    tg_user = from_user or message.from_user
+    user = await get_or_create_user(session, tg_user.id, tg_user.username)
     user.weight = data["weight"]
     user.height = data["height"]
     user.age = data["age"]
     user.gender = data["gender"]
     user.activity = data["activity"]
-    user.goal_weight = gw
+    user.goal_weight = goal_weight
+    user.mode = user_mode
     user.onboarded = True
     await session.commit()
 
     roadmap = build_roadmap(
         weight=data["weight"],
-        goal=gw,
+        goal=goal_weight,
         height=data["height"],
         age=data["age"],
         gender=data["gender"],
         activity=data["activity"],
+        mode=user_mode,
     )
-    await message.answer(format_roadmap(roadmap, data["weight"], gw))
+    await message.answer(format_roadmap(roadmap, data["weight"], goal_weight))
     await message.answer("Готово! Теперь выбери действие:", reply_markup=main_menu())
     await state.clear()
 
@@ -218,7 +336,17 @@ async def onb_goal(message: Message, state: FSMContext, session: AsyncSession):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @router.callback_query(F.data == "checkin")
-async def start_checkin(callback: CallbackQuery, state: FSMContext):
+async def start_checkin(callback: CallbackQuery, state: FSMContext, session: AsyncSession):
+    user = await get_or_create_user(session, callback.from_user.id, callback.from_user.username)
+    progress = await get_progress(session, user.id)
+    if progress.last_checkin_date == date.today():
+        await callback.message.edit_text(
+            "✅ Ты уже сделал(а) чек-ин сегодня. Приходи завтра!",
+            reply_markup=main_menu(),
+        )
+        await callback.answer()
+        return
+
     await callback.message.edit_text(
         "📋 <b>Ежедневный чек-ин</b>\n\n"
         "Введи текущий <b>вес</b> (в кг) или нажми «Пропустить»:",
@@ -278,13 +406,38 @@ async def ci_stress(callback: CallbackQuery, state: FSMContext):
 
 
 @router.callback_query(CheckInState.mood, F.data.startswith("mood_"))
-async def ci_mood(callback: CallbackQuery, state: FSMContext, session: AsyncSession, llm, kb):
-    await callback.answer()
+async def ci_mood(callback: CallbackQuery, state: FSMContext):
     val = int(callback.data.split("_")[1])
+    await state.update_data(ci_mood=val)
+    await callback.message.edit_text(
+        "📝 Коротко расскажи, <b>как прошёл день</b>: чем занимался, как питался, "
+        "была ли активность?\n\nИли нажми «Пропустить».",
+        reply_markup=skip_note_keyboard(),
+    )
+    await state.set_state(CheckInState.note)
+    await callback.answer()
+
+
+@router.message(CheckInState.note)
+async def ci_note_text(message: Message, state: FSMContext, session: AsyncSession, llm, kb):
+    await state.update_data(ci_note=message.text)
+    await _finish_checkin(message, state, session, llm, kb)
+
+
+@router.callback_query(CheckInState.note, F.data == "checkin_skip_note")
+async def ci_skip_note(callback: CallbackQuery, state: FSMContext, session: AsyncSession, llm, kb):
+    await callback.answer()
+    await state.update_data(ci_note=None)
+    await _finish_checkin(callback.message, state, session, llm, kb, from_user=callback.from_user)
+
+
+async def _finish_checkin(message, state: FSMContext, session: AsyncSession, llm, kb, from_user=None):
+    """Save check-in, run analysis, generate quests."""
     data = await state.get_data()
     await state.clear()
 
-    user = await get_or_create_user(session, callback.from_user.id, callback.from_user.username)
+    tg_user = from_user or message.from_user
+    user = await get_or_create_user(session, tg_user.id, tg_user.username)
 
     if data.get("ci_weight"):
         user.weight = data["ci_weight"]
@@ -294,7 +447,8 @@ async def ci_mood(callback: CallbackQuery, state: FSMContext, session: AsyncSess
         weight=data.get("ci_weight"),
         sleep_hours=data.get("ci_sleep"),
         stress=data.get("ci_stress"),
-        mood=val,
+        mood=data.get("ci_mood"),
+        note=data.get("ci_note"),
     )
     session.add(checkin)
 
@@ -308,7 +462,7 @@ async def ci_mood(callback: CallbackQuery, state: FSMContext, session: AsyncSess
 
     await session.commit()
 
-    await callback.message.edit_text("⏳ Анализирую данные…")
+    await message.answer("⏳ Анализирую данные…")
 
     try:
         recent = await get_recent_checkins(session, user.id)
@@ -316,46 +470,88 @@ async def ci_mood(callback: CallbackQuery, state: FSMContext, session: AsyncSess
             agents.analyze_state(llm, user, recent), timeout=120,
         )
 
-        recent_quests = await get_recent_quests(session, user.id)
-        quest_dicts = await asyncio.wait_for(
-            agents.generate_quests(llm, analysis, recent_quests), timeout=120,
-        )
-
-        for qd in quest_dicts:
-            quest = Quest(
-                user_id=user.id,
-                title=qd.get("title", "Квест"),
-                description=qd.get("description"),
-                category=qd.get("category", "activity"),
-                xp_reward=qd.get("xp", 10),
+        existing_quests = await get_today_quests(session, user.id)
+        if not existing_quests:
+            recent_quests = await get_recent_quests(session, user.id)
+            notes = [c.note for c in recent if c.note]
+            quest_dicts = await asyncio.wait_for(
+                agents.generate_quests(llm, analysis, recent_quests, notes), timeout=120,
             )
-            session.add(quest)
-        await session.commit()
+
+            for qd in quest_dicts:
+                quest = Quest(
+                    user_id=user.id,
+                    title=qd.get("title", "Квест"),
+                    description=qd.get("description"),
+                    category=qd.get("category", "activity"),
+                    xp_reward=qd.get("xp", 10),
+                )
+                session.add(quest)
+            await session.commit()
 
         summary = analysis.get("summary", "")
+        advice = analysis.get("advice", "")
         mode_tag = " 🌿 <i>Мягкий режим активирован</i>" if analysis.get("soft_mode") else ""
 
-        lines = [f"📊 <b>Результат чек-ина</b>{mode_tag}\n", summary, "\n⚔️ <b>Квесты на сегодня:</b>"]
+        lines = [f"📊 <b>Результат чек-ина</b>{mode_tag}\n", summary]
+        if advice:
+            lines.append(f"\n💡 {advice}")
+        lines.append("\n⚔️ <b>Квесты на сегодня:</b>")
 
         today_quests = await get_today_quests(session, user.id)
         for q in today_quests:
-            if not q.completed:
+            if not q.completed and not q.skipped:
                 lines.append(f"\n• <b>{q.title}</b> ({q.category}) — {q.xp_reward} XP")
                 if q.description:
                     lines.append(f"  <i>{q.description}</i>")
 
-        await callback.message.answer(
-            "\n".join(lines),
-            reply_markup=main_menu(),
+        await message.answer("\n".join(lines), reply_markup=main_menu())
+
+        goal_reached = (
+            user.mode != "maintenance"
+            and user.goal_weight
+            and data.get("ci_weight")
+            and abs(user.weight - user.goal_weight) <= 1.0
         )
+        if goal_reached:
+            await message.answer(
+                "🎉 <b>Поздравляю!</b> Твой вес сейчас в пределах целевого.\n\n"
+                "Хочешь перейти в <b>режим удержания веса</b>? "
+                "Квесты сфокусируются на закреплении привычек.",
+                reply_markup=yes_no_keyboard("maint_switch"),
+            )
 
     except Exception as e:
         logger.error("Check-in processing failed: %s", e, exc_info=True)
-        await callback.message.answer(
+        await message.answer(
             "✅ Чек-ин сохранён!\n\n"
             "Не удалось сгенерировать квесты — попробуй позже через меню.",
             reply_markup=main_menu(),
         )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Maintenance switch (after check-in goal reached)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@router.callback_query(F.data == "maint_switch_yes")
+async def maint_switch_yes(callback: CallbackQuery, session: AsyncSession):
+    user = await get_or_create_user(session, callback.from_user.id, callback.from_user.username)
+    user.mode = "maintenance"
+    user.goal_weight = user.weight
+    await session.commit()
+    await callback.message.edit_text(
+        "🏠 <b>Режим удержания активирован!</b>\n\n"
+        "Теперь квесты и советы будут направлены на сохранение результата и закрепление привычек.",
+    )
+    await callback.message.answer("Выбери действие:", reply_markup=main_menu())
+    await callback.answer()
+
+
+@router.callback_query(F.data == "maint_switch_no")
+async def maint_switch_no(callback: CallbackQuery):
+    await callback.message.edit_text("Хорошо, продолжаем в прежнем режиме! 💪")
+    await callback.answer()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -374,11 +570,16 @@ async def show_quests(callback: CallbackQuery, session: AsyncSession):
         return
 
     for q in today_quests:
-        status = "✅" if q.completed else "⏳"
+        if q.skipped:
+            status = "⏭"
+        elif q.completed:
+            status = "✅"
+        else:
+            status = "⏳"
         text = f"{status} <b>{q.title}</b> — {q.xp_reward} XP\n"
         if q.description:
             text += f"<i>{q.description}</i>\n"
-        markup = None if q.completed else quest_actions(q.id)
+        markup = None if q.completed or q.skipped else quest_actions(q.id)
         await callback.message.answer(text, reply_markup=markup)
 
     await callback.answer()
@@ -397,8 +598,8 @@ async def complete_quest(callback: CallbackQuery, session: AsyncSession):
     quest.completed_at = datetime.utcnow()
 
     progress = await get_progress(session, quest.user_id)
-    xp_msg = add_xp(progress, quest.xp_reward)
-    achievement_msgs = check_achievements(progress, session)
+    xp_msg, old_xp, old_level = add_xp(progress, quest.xp_reward)
+    achievement_msgs = check_achievements(progress, old_xp, old_level)
 
     await session.commit()
 
@@ -415,9 +616,11 @@ async def skip_quest(callback: CallbackQuery, session: AsyncSession):
     quest_id = int(callback.data.split("_")[-1])
     result = await session.execute(select(Quest).where(Quest.id == quest_id))
     quest = result.scalar_one_or_none()
-    if quest and not quest.completed:
-        quest.completed = False
-        await session.commit()
+    if not quest or quest.completed or quest.skipped:
+        await callback.answer("Квест уже выполнен, пропущен или не найден.")
+        return
+    quest.skipped = True
+    await session.commit()
     await callback.message.edit_text(f"⏭ Квест «{quest.title}» пропущен.")
     await callback.answer()
 
@@ -452,6 +655,41 @@ async def show_profile(callback: CallbackQuery, session: AsyncSession):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# Roadmap
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@router.callback_query(F.data == "roadmap")
+async def show_roadmap(callback: CallbackQuery, session: AsyncSession):
+    user = await get_or_create_user(session, callback.from_user.id, callback.from_user.username)
+    if not user.onboarded or not all([user.weight, user.goal_weight, user.height, user.age, user.gender]):
+        await callback.message.edit_text(
+            "Пока нет данных для роадмапа. Пройди онбординг через /start.",
+            reply_markup=main_menu(),
+        )
+        await callback.answer()
+        return
+
+    roadmap = build_roadmap(
+        weight=user.weight,
+        goal=user.goal_weight,
+        height=user.height,
+        age=user.age,
+        gender=user.gender,
+        activity=user.activity or "sedentary",
+        mode=user.mode or "active",
+    )
+    text = format_roadmap(roadmap, user.weight, user.goal_weight)
+
+    if user.mode != "maintenance":
+        diff = abs(user.weight - user.goal_weight)
+        if diff < 0.5:
+            text += "\n\n🎉 <b>Ты почти у цели!</b> Осталось совсем чуть-чуть."
+
+    await callback.message.edit_text(text, reply_markup=main_menu())
+    await callback.answer()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Free-text: RAG questions & crisis detection
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -472,7 +710,7 @@ async def free_text(message: Message, session: AsyncSession, llm, kb, state: FSM
 
     text_lower = message.text.lower()
 
-    if any(kw in text_lower for kw in CRISIS_KEYWORDS):
+    if any(phrase in text_lower for phrase in CRISIS_PHRASES):
         await message.answer(CRISIS_REPLY, reply_markup=main_menu())
         return
 

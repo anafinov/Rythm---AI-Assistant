@@ -13,14 +13,15 @@ def calc_level(xp: int) -> int:
     return 1 + xp // 100
 
 
-def add_xp(progress: UserProgress, base_xp: int) -> str:
+def add_xp(progress: UserProgress, base_xp: int) -> tuple[str, int, int]:
     """Add XP to user progress, apply streak bonus, recalculate level.
-    Returns a human-readable message."""
+    Returns (message, old_xp, old_level) for achievement checks."""
+    old_xp = progress.xp
+    old_level = progress.level
+
     multiplier = STREAK_MULTIPLIER if progress.streak_days >= STREAK_BONUS_THRESHOLD else 1.0
     earned = int(base_xp * multiplier)
     progress.xp += earned
-
-    old_level = progress.level
     progress.level = calc_level(progress.xp)
 
     bonus_note = f" (x{multiplier} streak bonus!)" if multiplier > 1 else ""
@@ -29,21 +30,20 @@ def add_xp(progress: UserProgress, base_xp: int) -> str:
     if progress.level > old_level:
         msg += f"\n🎉 <b>Уровень {progress.level}!</b> Поздравляю!"
 
-    return msg
+    return msg, old_xp, old_level
 
 
-def check_achievements(progress: UserProgress, session) -> list[str]:
-    """Return list of achievement messages earned (simple rule-based)."""
+def check_achievements(progress: UserProgress, old_xp: int, old_level: int) -> list[str]:
+    """Return list of achievement messages earned by crossing thresholds."""
     msgs = []
-    total_xp = progress.xp
 
-    if total_xp >= 10 and total_xp - 10 < 100:
+    if old_xp < 10 <= progress.xp:
         msgs.append("🏆 Ачивка: <b>Первый шаг</b> — ты начал путь!")
     if progress.streak_days == 7:
         msgs.append("🏆 Ачивка: <b>Неделя силы</b> — 7 дней подряд!")
     if progress.streak_days == 30:
         msgs.append("🏆 Ачивка: <b>Несокрушимый</b> — 30 дней подряд!")
-    if progress.level == 5:
+    if old_level < 5 <= progress.level:
         msgs.append("🏆 Ачивка: <b>Уровень 5</b> — ты прокачиваешься!")
 
     return msgs
